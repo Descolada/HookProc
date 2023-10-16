@@ -15,57 +15,6 @@
 #include <mutex>
 using namespace std::chrono;
 
-/*
-*
-* Main functions:
-*   HANDLE SetHook(_In_ int idHook, _In_ UINT uMsg, _In_ DWORD dwThreadId, _In_ LONG_PTR* lpMsgArr, _In_ int nMsgArr, _In_ HWND hTargetWnd, _In_ DWORD uTimeout);
-*       Sets a new hook using SetWindowsHookEx, using this dll for injection.
-*           uMsg needs to be a message (eg from RegisterWindowMessage) which is used by SendMessage
-*               to communicate between the dll and AHK script.
-*           lpMsgArr is an array of monitored nCodes, maximum of 9 values.
-*               This limitation is set because of how slow AHK is, and how slow inter-process communication is.
-*               0xFFFFFFFF to match any nCode.
-*               In the case of WH_CALLWNDPROC this should be an array of monitored window messages (eg WM_PASTE)
-*           nMsgArr is the number of elements in lpMsgArr.
-*           hTargetWnd is the window SendMessage targets, usually A_ScriptHwnd
-*           uTimeout specifies a timeout in milliseconds, which is highly recommended to be set to avoid freezes.
-*       Returns a handle to the hook, which can be used only by the script that created it.
-*
-*   LRESULT UnHook(_In_ HHOOK hHandle);
-*       Unhooks the hook and removes it from shared memory.
-*   LRESULT Close();
-*       Unhooks all hooks created by the same caller, and removes them from memory.
-*   LRESULT ClearSharedMemory();
-*       Cleares the shared memory space of all previous hook info. This is mainly used for debugging
-*       (eg when a script unexpectedly crashes and doesn't clean up after itself).
-*
-* Limitations:
-*   lpMsgArr maximum size is 9 elements.
-*   Maximum number of hooks is 16.
-*   Slow: on my setup each call takes about 200 microseconds.
-*   HCBT_CREATEWND CBT_CREATEWND -> CREATESTRUCT -> lpszName and lpszClass can't be accessed
-*
-* Inner workings:
-*
-* When a new hook is added:
-* 1) The hook index (starting from 0, max 15) is bound to the corresponding Proc function (eg CBTProc), creating a thunk
-* 2) The thunk is stored in a shared memory space (file mapping) pSharedFile/pSharedArray
-* 3) The thunk is copied over to a local mThunks variable
-* 4) The rest of the shared memory space which is allocated to thunks is filled with stubs (pointing to
-* StubProc), which when called will try to update mThunks
-* 5) SetWindowsHookEx is given an address in mThunks
-*
-* Shared memory space is automatically loaded on Dll process attach, and subsequently copied to mThunks.
-* A local copy of the hook info is kept in HookProc static variable cachedInfo, which is updated when
-* a matching index is not found (eg when StubProc is called), and in that case mThunks is also updated.
-*
-* When a Proc function is called, it tries to locate its index from cachedInfo and stores it in the local
-* scope. Then a process handle to AHK is opened, and SendMessage is used to send all info to AHK.
-* AHK can use ReadRemoteMemory/WriteRemoteMemory to access the proc info, and the return value is used as
-* the LRESULT for the Proc function (except when the result is <0, in which case CallNextHookEx is called instead).
-*
-*/
-
 struct ProcInfo {
     int nCode;
     WPARAM wParam;
@@ -241,9 +190,6 @@ size_t vbind(
 size_t AddThunk(int index, void* proc) {
     unsigned char thunk[MAX_SIZEOF_THUNK]; void* args[] = { (void*)index };
     size_t thunk_size = vbind((void* (*)())proc, 4, thunk, 0, args, sizeof(args) / sizeof(*args), false);
-#ifdef _DEBUG
-    slogf("Created thunk with size %d at location %d\n", thunk_size, STARTOF_THUNKS + index * MAX_SIZEOF_THUNK);
-#endif
     memcpy(&(((unsigned char*)pSharedFile)[STARTOF_THUNKS + index * MAX_SIZEOF_THUNK]), thunk, MAX_SIZEOF_THUNK);
     return thunk_size;
 }
@@ -421,17 +367,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     switch (fdwReason)
     {
     case DLL_THREAD_ATTACH:
-#ifdef _DEBUG
-        slogf("New thread attached: %d, global ghSharedFileSemaphore: %d \n", hinstDLL, ghSharedFileSemaphore);
-#endif
         break;
     case DLL_PROCESS_ATTACH: // global variables are shared between threads, so init only for process is enough
         ghCBSemaphore = OpenSemaphore(SEMAPHORE_MODIFY_STATE | SYNCHRONIZE, 0, szCBMutex);
         ghSharedFileSemaphore = OpenSemaphore(SEMAPHORE_MODIFY_STATE | SYNCHRONIZE, 0, szSharedFileMutex);
         OpenSharedMemory();
-#ifdef _DEBUG
-        slogf("Process attached: %d, %lld, %lld, %lld, %lld\n", hinstDLL, &CBTProc, &gbIsFirstProcess, &(mThunks[0]), &(mThunks[161]));
-#endif
 
         // create a stub to which all calls to unknown thunks are forwarded
         mStubThunkSize = vbind((void* (*)())StubProc, 4, mStubThunk, 0, args, sizeof(args) / sizeof(*args), false);
@@ -452,9 +392,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             ReleaseSemaphore(ghSharedFileSemaphore, 1, 0);
 
         unsigned long old;
-#ifdef _DEBUG
-        slogf("Protecting mThunk with size %d\n", MAX_SIZEOF_THUNK * MAX_NUM_OF_HOOKS);
-#endif
 
         VirtualProtect(mThunks, MAX_SIZEOF_THUNK * MAX_NUM_OF_HOOKS, PAGE_EXECUTE_READWRITE, &old);
 
@@ -463,14 +400,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         break;
 
     case DLL_THREAD_DETACH:
-#ifdef _DEBUG
-        slogf("New thread detached: %d, global ghSharedFileSemaphore: %d \n", hinstDLL, ghSharedFileSemaphore);
-#endif
         break;
     case DLL_PROCESS_DETACH:
-#ifdef _DEBUG
-        slogf("Process detached: %d\n", hinstDLL);
-#endif
 
         dwWaitResult = WaitForSingleObject(ghSharedFileSemaphore, SHARED_FILE_MUTEX_TIMEOUT);
 
@@ -509,10 +440,7 @@ extern "C" __declspec(dllexport) LRESULT Close() {
         }
         if (dwWaitResult == WAIT_OBJECT_0)
             ReleaseSemaphore(ghSharedFileSemaphore, 1, 0);
-        //UnmapViewOfFile(pSharedFile);
     }
-    //if (hMapFile)
-    //    CloseHandle(hMapFile);
     return 0;
 }
 
@@ -603,16 +531,7 @@ extern "C" __declspec(dllexport) HANDLE SetHook(_In_ int idHook, _In_ UINT uMsg,
         pSharedArray[offset + 5] = dwTimeout <= 0 ? 0xFFFFFFFF : dwTimeout;
         pSharedArray[offset + 6] = (LONG_PTR)nMsgArr;
         CopyMemory(&((pSharedArray)[offset + 7]), lpMsgArr, min(nMsgArr, (SIZEOF_BLOCK - 7)) * sizeof(LONG_PTR));
-
-#ifdef _DEBUG
-        slogf("Set hook at index %d with hHook %d, idHook %d, timeout %d, proc %lld inserted at %d, bits of hook=%d\n", index, hHook, idHook, dwTimeout, proc, STARTOF_THUNKS + index * MAX_SIZEOF_THUNK, pSharedArray[1]);
-#endif
-
     }
-#ifdef _DEBUG
-    else
-        slogf("Failed to set hook with idHook %d, timeout %d, proc %lld inserted at %d\n", idHook, dwTimeout, proc, STARTOF_THUNKS);
-#endif
 
     ReleaseSemaphore(ghSharedFileSemaphore, 1, 0);
     return hHook;
@@ -624,7 +543,6 @@ extern "C" __declspec(dllexport) LRESULT UnHook(_In_ HHOOK hHandle) {
 }
 
 extern "C" __declspec(dllexport) LRESULT CALLBACK StubProc(_In_ int index, _In_ int nCode, _In_ WPARAM wParam, _In_ LPARAM lParam) {
-    slogf("StubProc was called with index=%d\n", index);
     if (index == -1) {
         LRESULT CBResult = 0; HHOOK hHook = 0; ProcInfo info = {};
         // call HookProc with stub values to force an update of cache
@@ -644,9 +562,6 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK CallWndProc(_In_ int index, _I
     LRESULT CBResult, result = HookProc(index, WH_CALLWNDPROC, pCW->message, (LONG_PTR)&info, CBResult, thisHook);
 
     if (pCW->message == WM_PASTE) {
-#ifdef _DEBUG
-        slogf("Paste event detected in Notepad\n", nCode, pCW->hwnd);
-#endif
         auto found = gOldWndInfo.find(hVLWnd);
         if (found == gOldWndInfo.end()) {
             //gOldWndInfo[hVLWnd] = (WNDPROC)SetWindowLongPtr(hVLWnd, GWLP_WNDPROC, (LRESULT)NewWndProc);
@@ -660,9 +575,6 @@ LRESULT CALLBACK NewWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     LONG_PTR paramArray[4] = { (LONG_PTR)hWnd, (LONG_PTR)uMsg, (LONG_PTR)wParam, (LONG_PTR)lParam };
 
     // In any case reset the WndProc back to the old one
-#ifdef _DEBUG
-    slogf("NewWndProc was triggered\n");
-#endif
     processMutex.lock();
     auto found = gOldWndInfo.find(hWnd);
     WNDPROC WndProc = NULL;
@@ -679,10 +591,6 @@ LRESULT CALLBACK NewWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     NewWndProcInfo info = { hWnd, uMsg, wParam, lParam };
     HHOOK hHook = 0;
     LRESULT CBResult = 0, result = HookProc(index, WH_CALLWNDPROC | 0xF000, uMsg, (LONG_PTR)&info, CBResult, hHook);
-
-#ifdef _DEBUG
-    slogf("NewWndProc returned result %d and CBResult %d\n", result, CBResult);
-#endif
 
     if (result == 0 && CBResult >= 0)
         return CBResult;
@@ -711,11 +619,6 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK CBTProc(_In_ int index, _In_ i
     ProcInfo info = { nCode, wParam, lParam };
     HHOOK hHook = 0;
 
-#ifdef _DEBUG
-    if (nCode == HCBT_MINMAX || nCode == HCBT_CREATEWND || nCode == HCBT_DESTROYWND)
-        slogf("CBTProc called with index=%d, nCode=%d, wparam=%d, lparam=%d\n", index, nCode, wParam, lParam);
-#endif 
-
     auto start = high_resolution_clock::now();
 
     LRESULT CBResult = 0, result = HookProc(index, WH_CBT, nCode, (LONG_PTR)&info, CBResult, hHook);
@@ -724,18 +627,11 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK CBTProc(_In_ int index, _In_ i
     auto duration = duration_cast<microseconds>(stop - start);
 
     if (result == 0) {
-
-        slogf("CBTProc nCode=%d, wParam=%d, lParam=%d, index=%d got result=0 and CBResult=%d with time=%d micros\n", nCode, wParam, lParam, index, CBResult, duration.count());
-
         if (CBResult < 0)
             return CallNextHookEx(hHook, nCode, wParam, lParam);
         else
             return CBResult;
     }
-
-    else if (nCode == 1 || nCode == 3 || nCode == 4)
-        slogf("CBTProc failed, returned %d in %d micros\n", result, duration.count());
-
 
     return CallNextHookEx(hHook, nCode, wParam, lParam);
 }
@@ -815,26 +711,19 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK SysMsgProc(_In_ int index, _In
 }
 
 LRESULT HookProc(int index, int idHook, int nCode, LONG_PTR info, LRESULT& CBResult, HHOOK& hHook) {
-    static int nFailures = 0, lastVersion = 0;
-    // cachedInfo[idHook][threadId] = {hHook, registredCodes}
     static std::map<DWORD, HookInfo> cachedInfo = {};
 
     if (!hMapFile || !pSharedArray) {
-        nFailures++;
         return ERR_MAPFILE_UNAVAILABLE;
     }
 
     if (!ghSharedFileSemaphore || !ghCBSemaphore) {
-        nFailures++;
         return ERR_CB_MUTEX_UNAVAILABLE;
     }
 
     processMutex.lock();
 
     if (cachedInfo.find(index) == cachedInfo.end()) {
-#ifdef _DEBUG
-        slogf("Updating cached info because %d >= %d\n", index, cachedInfo.size());
-#endif
         LRESULT result = UpdateCallbackInfo(cachedInfo);
         if (result) {
             processMutex.unlock();
@@ -861,10 +750,6 @@ LRESULT HookProc(int index, int idHook, int nCode, LONG_PTR info, LRESULT& CBRes
 
     processMutex.unlock();
 
-#ifdef _DEBUG
-    if (nCode == WM_PASTE || nCode == 1 || nCode == 3)
-        slogf("UpdateCallbackInfo returned idHook %d, nCode %d, hHook %lld, uMsg %lld, usedThreadId %d\n", idHook, nCode, hHook, uMsg, usedThreadId);
-#endif
 
     if (idHook == WH_CALLWNDPROC) { // in this case 
         processMutex.lock();
@@ -873,9 +758,6 @@ LRESULT HookProc(int index, int idHook, int nCode, LONG_PTR info, LRESULT& CBRes
         if (found == gOldWndInfo.end()) {
             gOldWndInfo[hVLWnd] = { index, (WNDPROC)SetWindowLongPtr(hVLWnd, GWLP_WNDPROC, (LRESULT)NewWndProc) };
             CBResult = 0; // prevent
-#ifdef _DEBUG
-            slogf("This was prevented, hwnd %d  OldWndProc %lld\n", hVLWnd, gOldWndInfo[hVLWnd].second);
-#endif
             processMutex.unlock();
             return 0;
         }
@@ -893,9 +775,6 @@ LRESULT HookProc(int index, int idHook, int nCode, LONG_PTR info, LRESULT& CBRes
         hTargetProc = OpenProcess(PROCESS_DUP_HANDLE, 0, targetPID);
     if (!hTargetProc) {
         // main process is probably dead, so exit
-#ifdef _DEBUG
-        slogf("Program dead, RemoveHookFromMemory index=%d\n", index);
-#endif
         RemoveIndexFromSharedMemory(index);
         return ERROR_CLASS_DOES_NOT_EXIST;
     }
@@ -912,31 +791,16 @@ LRESULT HookProc(int index, int idHook, int nCode, LONG_PTR info, LRESULT& CBRes
         return ERROR_ACCESS_DENIED;
     }
 
-#ifdef _DEBUG
-    slogf("Sending message to hwnd=%d, uMsg=%d, wparam=%d, lparam=%d\n", hTargetWnd, uMsg, hDuplicate, &info);
-#endif
 
     LRESULT result = 1;
     if (uTimeout == INFINITE)
         CBResult = SendMessage(hTargetWnd, uMsg, (WPARAM)hDuplicate, (LPARAM)info);
     else {
         result = SendMessageTimeout(hTargetWnd, uMsg, (WPARAM)hDuplicate, (LPARAM)info, 0, uTimeout, (PDWORD_PTR)&CBResult);
-        slogf("SendMessageTimeout result %d, CBResult %d, nCode=%d\n", result, CBResult, nCode);
     }
 
     CloseHandle(hCurrentProc);
     CloseHandle(hTargetProc);
 
-    if (result == 0) {
-        nFailures++;
-    }
-    else {
-        nFailures = 0;
-    }
-
-#ifdef _DEBUG
-    if (nCode == WM_PASTE || nCode == 1 || nCode == 3)
-        slogf("CallbackToAHK result %d, CBResult %d\n", result, CBResult);
-#endif
     return result == 0 ? GetLastError() : 0;
 }
