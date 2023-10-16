@@ -39,6 +39,7 @@ struct HookInfo {
 
 void OpenSharedMemory();
 void CloseSharedMemory();
+extern "C" __declspec(dllexport) LRESULT GetHooks();
 extern "C" __declspec(dllexport) HANDLE SetHook(_In_ int idHook, _In_ UINT uMsg, _In_ DWORD dwThreadId, _In_ LONG_PTR * lpMsgArr, _In_ int nMsgArr, _In_ HWND hTargetWnd, _In_ DWORD uTimeout);
 extern "C" __declspec(dllexport) LRESULT UnHook(_In_ HHOOK hHandle);
 extern "C" __declspec(dllexport) LRESULT ClearSharedMemory();
@@ -112,6 +113,10 @@ unsigned char mThunks[4096], mStubThunk[MAX_SIZEOF_THUNK];
 // gnCurrentInstalledHooks keeps track of used indices with bitwise shifts 
 // eg. gnCurrentInstalledHooks & (1 << 5) means index 5 (6th hook) is created by this AHK script
 int mStubThunkSize = 0, gnCurrentInstalledHooks = 0;
+
+extern "C" __declspec(dllexport) LRESULT GetHooks() {
+    return 0;
+}
 
 // Source: https://stackoverflow.com/questions/12136309/how-to-thunk-a-function-in-x86-and-x64-like-stdbind-in-c-but-dynamic
 size_t vbind(
@@ -440,7 +445,10 @@ extern "C" __declspec(dllexport) LRESULT Close() {
         }
         if (dwWaitResult == WAIT_OBJECT_0)
             ReleaseSemaphore(ghSharedFileSemaphore, 1, 0);
+        //UnmapViewOfFile(pSharedFile);
     }
+    //if (hMapFile)
+    //    CloseHandle(hMapFile);
     return 0;
 }
 
@@ -531,6 +539,8 @@ extern "C" __declspec(dllexport) HANDLE SetHook(_In_ int idHook, _In_ UINT uMsg,
         pSharedArray[offset + 5] = dwTimeout <= 0 ? 0xFFFFFFFF : dwTimeout;
         pSharedArray[offset + 6] = (LONG_PTR)nMsgArr;
         CopyMemory(&((pSharedArray)[offset + 7]), lpMsgArr, min(nMsgArr, (SIZEOF_BLOCK - 7)) * sizeof(LONG_PTR));
+
+
     }
 
     ReleaseSemaphore(ghSharedFileSemaphore, 1, 0);
@@ -561,13 +571,6 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK CallWndProc(_In_ int index, _I
     HHOOK thisHook = 0;
     LRESULT CBResult, result = HookProc(index, WH_CALLWNDPROC, pCW->message, (LONG_PTR)&info, CBResult, thisHook);
 
-    if (pCW->message == WM_PASTE) {
-        auto found = gOldWndInfo.find(hVLWnd);
-        if (found == gOldWndInfo.end()) {
-            //gOldWndInfo[hVLWnd] = (WNDPROC)SetWindowLongPtr(hVLWnd, GWLP_WNDPROC, (LRESULT)NewWndProc);
-        } // otherwise the proc is already set probably
-    }
-
     return CallNextHookEx(thisHook, nCode, wParam, lParam);
 }
 
@@ -591,6 +594,7 @@ LRESULT CALLBACK NewWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     NewWndProcInfo info = { hWnd, uMsg, wParam, lParam };
     HHOOK hHook = 0;
     LRESULT CBResult = 0, result = HookProc(index, WH_CALLWNDPROC | 0xF000, uMsg, (LONG_PTR)&info, CBResult, hHook);
+
 
     if (result == 0 && CBResult >= 0)
         return CBResult;
@@ -619,12 +623,9 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK CBTProc(_In_ int index, _In_ i
     ProcInfo info = { nCode, wParam, lParam };
     HHOOK hHook = 0;
 
-    auto start = high_resolution_clock::now();
 
     LRESULT CBResult = 0, result = HookProc(index, WH_CBT, nCode, (LONG_PTR)&info, CBResult, hHook);
 
-    auto stop = high_resolution_clock::now();
-    auto duration = duration_cast<microseconds>(stop - start);
 
     if (result == 0) {
         if (CBResult < 0)
